@@ -1,0 +1,390 @@
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const { createHash } = require('node:crypto');
+const { MeetingSession, uploadPdfParts } = require('../live-session.js');
+const adminKey = 'test06';
+const pdf = name => new File([`%PDF-1.7\n${name}\n%%EOF`], `${name}.pdf`, { type: 'application/pdf' });
+
+test('legacy upload handlers explain server restart or Functions deployment instead of blaming a valid image', async () => {
+  const file = new File([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])], 'screenshot.png', { type: 'image/png' });
+  for (const [host, explanation] of [['localhost:8888', /Ctrl\+C/], ['dashboard.test', /Functions/]]) {
+    await assert.rejects(uploadPdfParts({ room: 'room', file, key: adminKey, purpose: 'message',
+      endpoint: `http://${host}/.netlify/functions/meeting-document`,
+      fetcher: async () => new Response(JSON.stringify({ error: '올바른 PDF 파일을 선택해주세요.' }), { status: 400 }) }), explanation);
+  }
+});
+
+test('25MB PDF transfers in bounded requests, preserves its mode, and verifies the reconstructed bytes', async () => {
+  const f = await fixture();
+  const bytes = Buffer.alloc(25_000_000, 42);
+  bytes.write('%PDF-1.7\n');
+  const file = new File([bytes], '수감자료.pdf', { type: 'application/pdf' });
+  const sizes = [], progress = [];
+  const { document } = await uploadPdfParts({ room: 'receipt', file, key: adminKey, documentType: 'receipt',
+    endpoint: 'https://dashboard.test/.netlify/functions/meeting-document', crypto: require('node:crypto').webcrypto,
+    onProgress: value => progress.push(value), fetcher: async (url, options) => {
+      const request = new Request(url, options);
+      const size = (await request.clone().arrayBuffer()).byteLength;
+      sizes.push(size);
+      return f.fileHandler(request);
+    } });
+  assert.equal(document.parts, 9);
+  assert.equal(document.documentType, 'receipt');
+  assert.equal(document.size, file.size);
+  assert(sizes.every(size => size <= 3_000_000));
+  assert.equal(f.published.length, 0);
+  const chunks = [];
+  for (let part = 0; part < document.parts; part++) {
+    const url = new URL(document.url, 'https://dashboard.test');
+    url.searchParams.set('part', part);
+    const response = await f.fileHandler(new Request(url));
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('cache-control'), 'private, max-age=86400, immutable');
+    chunks.push(Buffer.from(await response.arrayBuffer()));
+    url.searchParams.set('room', 'other');
+    assert.equal((await f.fileHandler(new Request(url))).status, 404);
+  }
+  assert.deepEqual(Buffer.concat(chunks), bytes);
+  assert.equal(createHash('sha256').update(Buffer.concat(chunks)).digest('hex'), document.id);
+  await f.request('receipt', { action: 'set-document', fileId: document.fileId, documentId: document.id, mode: 'question', questionId: 70 }, adminKey);
+  assert.equal(f.published[0].document.documentType, 'receipt');
+  assert.equal(f.published[0].document.parts, 9);
+  assert(progress.length >= 9);
+  const mutate = `https://dashboard.test/.netlify/functions/meeting-document?room=receipt&action=part&upload=${document.fileId}&part=0`;
+  assert.equal((await f.fileHandler(new Request(mutate, { method: 'POST',
+    headers: { Authorization: `Bearer ${adminKey}` }, body: bytes.subarray(0, 3_000_000) }))).status, 409);
+});
+
+test('next upload removes stale unused PDFs and failed chunks, preserving active, recent and other-room files', async () => {
+  const f = await fixture();
+  const { DOCUMENT_RETENTION_MS } = await import('../netlify/lib/meeting-documents.mjs');
+  const upload = name => f.uploadFile('room', pdf(name), adminKey);
+  const active = (await upload('active')).document;
+  const old = (await upload('old')).document;
+  const other = (await f.uploadFile('other', pdf('other'), adminKey)).document;
+  await f.request('room', { action: 'set-document', fileId: active.fileId, documentId: active.id, mode: 'question', questionId: 1 }, adminKey);
+  // Include completed multipart metadata and an abandoned upload.
+  const abandoned = '11111111-1111-1111-1111-111111111111';
+  const completed = '22222222-2222-2222-2222-222222222222';
+  for (const fileId of [abandoned, completed]) {
+    f.files.set(`${fileId}/pending`, { metadata: { room: 'room', createdAt: f.now() }, data: new ArrayBuffer(0) });
+    f.files.set(`${fileId}/part/0`, { metadata: { room: 'room' }, data: new ArrayBuffer(1) });
+  }
+  f.files.set(completed, f.files.get(`${completed}/pending`));
+  f.advance(DOCUMENT_RETENTION_MS + 1);
+  await assert.rejects(f.request('room', { action: 'set-document', fileId: old.fileId, documentId: old.id,
+    mode: 'question', questionId: 2 }, adminKey), /오래된 업로드/);
+  const recent = (await upload('recent')).document;
+  assert(f.files.has(active.fileId), 'active PDF survives even an expired meeting snapshot');
+  assert(f.files.has(other.fileId), 'other rooms are untouched');
+  assert(f.files.has(recent.fileId));
+  assert(!f.files.has(old.fileId));
+  for (const fileId of [abandoned, completed]) {
+    assert(![...f.files.keys()].some(key => key.startsWith(fileId)));
+  }
+  const next = (await upload('next')).document;
+  assert(f.files.has(recent.fileId));
+  assert(f.files.has(next.fileId));
+  assert.equal(f.states.get('room').document.fileId, active.fileId);
+});
+
+test('cleanup failure does not block a new upload or change the active document', async t => {
+  const f = await fixture();
+  const original = (await f.uploadFile('room', pdf('original'), adminKey)).document;
+  await f.request('room', { action: 'set-document', fileId: original.fileId, documentId: original.id,
+    mode: 'question', questionId: 1 }, adminKey);
+  const warnings = t.mock.method(console, 'warn', () => {});
+  f.documents.list = async () => { throw new Error('list unavailable'); };
+  const next = (await f.uploadFile('room', pdf('new'), adminKey)).document;
+  assert(f.files.has(next.fileId));
+  assert(f.files.has(original.fileId));
+  assert.equal(f.states.get('room').document.fileId, original.fileId);
+  assert.equal(warnings.mock.callCount(), 1);
+});
+
+test('image and 5MB PDF messages use verified attachments without replacing the meeting PDF', async () => {
+  const f = await fixture();
+  const { downloadAttachment } = require('../message-media.js');
+  const crypto = require('node:crypto').webcrypto;
+  const base = 'https://dashboard.test/.netlify/functions/meeting-document';
+  const original = (await f.uploadFile('room', pdf('meeting'), adminKey)).document;
+  await f.request('room', { action: 'set-document', fileId: original.fileId, documentId: original.id, mode: 'question', questionId: 1 }, adminKey);
+  const snapshot = f.states.get('room');
+  const image = new File([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), 'test image'], 'photo.png', { type: 'image/png' });
+  const pdfBytes = Buffer.alloc(5_000_000, 42); pdfBytes.write('%PDF-1.7');
+  for (const file of [image, new File([pdfBytes], '첨부.pdf', { type: 'application/pdf' })]) {
+    const { document } = await uploadPdfParts({ room: 'room', key: adminKey, file, purpose: 'message', endpoint: base,
+      crypto, fetcher: (url, options) => f.fileHandler(new Request(url, options)) });
+    const message = (await f.request('room', { action: 'send-message', text: '', attachmentId: document.fileId }, adminKey)).message;
+    assert.equal(message.attachment.mediaType, file.type);
+    assert.equal(message.attachment.size, file.size);
+    assert.equal(f.states.get('room'), snapshot, 'message attachment cannot switch the main PDF');
+    const downloaded = await downloadAttachment(message.attachment, { endpoint: base, crypto,
+      fetcher: url => f.fileHandler(new Request(url)) });
+    assert.deepEqual(Buffer.from(downloaded), Buffer.from(await file.arrayBuffer()));
+    assert(JSON.stringify(f.published.at(-1)).length < 2000, 'Ably carries only metadata');
+    await assert.rejects(f.request('other', { action: 'send-message', text: '', attachmentId: document.fileId }, adminKey), /다시 선택/);
+    await assert.rejects(f.request('room', { action: 'set-document', fileId: document.fileId, documentId: document.id,
+      mode: 'question', questionId: 1 }, adminKey), /일치/);
+  }
+  await assert.rejects(f.request('room', { action: 'send-message', text: '', attachmentId: original.fileId }, adminKey), /다시 선택/);
+  await assert.rejects(f.request('room', { action: 'send-message', text: '', attachmentId: 'bad' }, adminKey), /올바르지/);
+  const lateMessages = (await f.request('room')).messages;
+  assert.equal(lateMessages.length, 2);
+  assert(lateMessages.every(message => message.attachment));
+  const shown = [];
+  const viewer = new MeetingSession({ request: f.request, subscribe: f.subscribe, getDocument: () => ({ ready: true }),
+    showTarget: async () => {}, onMessage: message => shown.push(message) });
+  await viewer.join('room');
+  assert.equal(shown.at(-1), null, 'old attachment messages are suppressed on entry');
+  for (const previous of lateMessages) await f.request('room', { action: 'send-message', text: '', attachmentId: previous.attachment.fileId }, adminKey);
+  assert.equal(shown.at(-1).attachment.mediaType, 'image/png');
+  viewer.dismissMessage();
+  assert.equal(shown.at(-1).attachment.mediaType, 'application/pdf');
+  viewer.leave();
+  const attachmentId = lateMessages[0].attachment.fileId;
+  f.advance(12 * 60 * 60 * 1000);
+  await assert.rejects(f.request('room', { action: 'send-message', text: '', attachmentId }, adminKey), /다시 선택/);
+  f.advance(12 * 60 * 60 * 1000 + 1);
+  await f.uploadFile('room', pdf('cleanup'), adminKey);
+  for (const message of lateMessages) assert(![...f.files.keys()].some(key => key.startsWith(message.attachment.fileId)));
+  assert(f.files.has(original.fileId));
+});
+
+test('attachment upload rejects unauthenticated, cross-origin, SVG, mismatched-purpose and oversized images', async () => {
+  const f = await fixture();
+  const upload = (body, headers = {}) => f.fileHandler(new Request('https://dashboard.test/.netlify/functions/meeting-document?room=room', {
+    method: 'POST', headers: { Authorization: `Bearer ${adminKey}`, 'X-Document-Purpose': 'message', ...headers }, body
+  }));
+  assert.equal((await upload('<svg onload="alert(1)"/>')).status, 400);
+  const image = Buffer.from([255, 216, 255, 224, 0, 0]);
+  assert.equal((await upload(image, { Authorization: 'Bearer wrong' })).status, 401);
+  assert.equal((await upload(image, { Origin: 'https://other.test' })).status, 403);
+  assert.equal((await upload(image, { 'X-Document-Purpose': '' })).status, 400);
+  assert.equal((await upload(image, { 'Content-Length': '4500001' })).status, 413);
+});
+
+test('cleanup uses metadata only, keeps unexpired uploads and retries interrupted deletion', async () => {
+  const { cleanupDocuments, DOCUMENT_RETENTION_MS } = await import('../netlify/lib/meeting-documents.mjs');
+  const expired = '33333333-3333-3333-3333-333333333333';
+  const recent = '44444444-4444-4444-4444-444444444444';
+  const files = new Map([
+    [`${expired}/pending`, { room: 'room', createdAt: 1 }],
+    [`${expired}/part/0`, { room: 'room' }],
+    [`${recent}/pending`, { room: 'room', createdAt: DOCUMENT_RETENTION_MS }],
+    [`${recent}/part/0`, { room: 'room' }]
+  ]);
+  let failed = false;
+  const options = { room: 'room', now: () => DOCUMENT_RETENTION_MS + 1,
+    meetings: { get: async () => null }, documents: {
+      list: async () => ({ blobs: [...files.keys()].map(key => ({ key })) }),
+      getMetadata: async key => ({ metadata: files.get(key) }),
+      delete: async key => {
+        if (!failed) { failed = true; throw new Error('temporary storage failure'); }
+        files.delete(key);
+      }
+    } };
+  await assert.rejects(cleanupDocuments(options), /temporary/);
+  assert(files.has(`${expired}/pending`));
+  await cleanupDocuments(options);
+  assert.deepEqual([...files.keys()], [`${recent}/pending`, `${recent}/part/0`]);
+});
+
+test('incomplete, corrupt, expired, and unauthorized chunk uploads cannot become active documents', async () => {
+  const f = await fixture();
+  const base = 'https://dashboard.test/.netlify/functions/meeting-document?room=room';
+  const post = (url, body, key = adminKey) => f.fileHandler(new Request(url, { method: 'POST', headers: { Authorization: `Bearer ${key}` }, body }));
+  const payload = JSON.stringify({ size: 6, id: 'a'.repeat(64), name: 'test.pdf', documentType: 'receipt' });
+  assert.equal((await post(base + '&action=init', payload, 'bad')).status, 401);
+  const init = await (await post(base + '&action=init', payload)).json();
+  const url = `${base}&upload=${init.uploadId}`;
+  assert.equal((await post(url + '&action=complete', '')).status, 409);
+  assert.equal((await post(url + '&action=part&part=1', '%PDF-a')).status, 400);
+  assert.equal((await post(url + '&action=part&part=0', 'broken')).status, 400);
+  assert.equal((await post(url + '&action=part&part=0', '%PDF-a')).status, 200);
+  assert.equal((await post(url + '&action=complete', '')).status, 409);
+  assert.equal(f.files.has(init.uploadId), false);
+  const metadata = f.files.get(`${init.uploadId}/pending`).metadata;
+  metadata.createdAt -= 3600001;
+  assert.equal((await post(url + '&action=complete', '')).status, 404);
+  assert.equal(f.published.length, 0);
+});
+
+async function fixture() {
+  const { createDocumentHandler, MAX_PDF_BYTES } = await import('../netlify/lib/meeting-documents.mjs');
+  const { createHandler } = await import('../netlify/functions/meeting.mjs');
+  const files = new Map(), states = new Map(), subscribers = new Set(), published = [], order = [];
+  let clock = Date.now();
+  const subscribe = async (_, handlers) => { subscribers.add(handlers.onState); return () => subscribers.delete(handlers.onState); };
+  const documents = {
+    list: async () => ({ blobs: [...files.keys()].map(key => ({ key })) }),
+    delete: async id => { files.delete(id); },
+    set: async (id, data, { metadata }) => { files.set(id, { data, metadata }); },
+    getWithMetadata: async id => files.get(id) || null,
+    getMetadata: async id => files.has(id) ? { metadata: files.get(id).metadata } : null
+  };
+  const fileHandler = createDocumentHandler({ documents, adminKey, now: () => clock,
+    meetings: { get: async room => states.get(room) || null } });
+  const meeting = createHandler({ adminKey, documents, now: () => clock,
+    store: { get: async room => states.get(room) || null, setJSON: async (room, state) => { states.set(room, state); } },
+    broker: { publish: async (room, state) => { published.push(state); for (const callback of subscribers) callback(state); } }
+  });
+  const parse = async response => {
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error);
+    return result;
+  };
+  const uploadFile = async (room, file, key) => {
+    order.push('upload');
+    return parse(await fileHandler(new Request(`https://dashboard.test/.netlify/functions/meeting-document?room=${room}`, {
+      method: 'POST', headers: { Authorization: `Bearer ${key}`, 'X-Pdf-Name': encodeURIComponent(file.name) }, body: file
+    })));
+  };
+  const request = async (room, body, key) => {
+    if (body?.action === 'set-document') order.push('commit');
+    return parse(await meeting(new Request(`https://dashboard.test/.netlify/functions/meeting?room=${room}`, {
+      method: body ? 'POST' : 'GET', headers: body ? { Authorization: `Bearer ${key}` } : {}, body: body ? JSON.stringify(body) : undefined
+    })));
+  };
+  const download = async descriptor => {
+    order.push('download');
+    const response = await fileHandler(new Request(new URL(descriptor.url, 'https://dashboard.test')));
+    assert.equal(response.status, 200);
+    return response.arrayBuffer();
+  };
+  return { files, states, documents, fileHandler, meeting, uploadFile, request, download, subscribers, published, order, MAX_PDF_BYTES,
+    subscribe, now: () => clock, advance: ms => { clock += ms; } };
+}
+
+test('admin uploads then downloads the exact object before publishing; participants and late joins switch PDFs automatically', async () => {
+  const f = await fixture();
+  let adminDoc = { ready: true, hosted: false, id: '0'.repeat(64) };
+  const shown = [];
+  const viewer = new MeetingSession({
+    request: f.request, getDocument: () => ({ ready: false }),
+    subscribe: async (_, handlers) => { f.subscribers.add(handlers.onState); return () => f.subscribers.delete(handlers.onState); },
+    showTarget: async state => { const bytes = await f.download(state.document); shown.push({ id: state.documentId, bytes: Buffer.from(bytes).toString(), question: state.questionId }); }
+  });
+  const admin = new MeetingSession({ request: f.request, subscribe: f.subscribe, uploadFile: f.uploadFile, getDocument: () => adminDoc,
+    getTarget: () => ({ mode: 'question', questionId: 1 }),
+    showDocument: async descriptor => {
+      const bytes = await f.download(descriptor);
+      assert.equal(createHash('sha256').update(Buffer.from(bytes)).digest('hex'), descriptor.id);
+      adminDoc = { ready: true, hosted: true, id: descriptor.id, shared: descriptor };
+    }
+  });
+  await admin.join('room', adminKey);
+  await viewer.join('room');
+  await admin.shareFile(pdf('first'));
+  await viewer.applyQueue;
+  assert.deepEqual(f.order.slice(0, 3), ['upload', 'download', 'commit']);
+  assert.match(shown[0].bytes, /first/);
+  assert.equal(shown[0].question, 1);
+  assert.equal(f.published.length, 1, 'PDF bytes are uploaded separately from the event');
+  assert.ok(!JSON.stringify(f.published[0]).includes('%PDF'));
+  await viewer.navigate({ mode: 'question', questionId: 7 });
+  await admin.shareFile(pdf('second'));
+  await viewer.applyQueue;
+  assert.match(shown[1].bytes, /second/);
+  assert.notEqual(shown[0].id, shown[1].id);
+  await admin.navigate({ mode: 'question', questionId: 4 });
+  await viewer.applyQueue;
+  assert.equal(shown.at(-1).question, 4);
+  assert.equal(f.states.get('room').document.id, adminDoc.id);
+  const late = new MeetingSession({ request: f.request, subscribe: async () => () => {}, getDocument: () => ({ ready: false }), showTarget: async state => { assert.equal(state.document.id, adminDoc.id); assert.equal(state.questionId, 4); } });
+  await late.join('room');
+  assert.equal(late.lastRevision, f.states.get('room').revision);
+});
+
+test('two admins take turns controlling one participant without uploading the shared PDF again', async () => {
+  const f = await fixture();
+  const makeAdmin = () => {
+    let doc = { ready: false };
+    return new MeetingSession({ request: f.request, subscribe: f.subscribe, now: f.now, uploadFile: f.uploadFile,
+      getDocument: () => doc, getTarget: () => ({ mode: 'question', questionId: 1 }),
+      showDocument: async descriptor => { await f.download(descriptor); doc = { ready: true, hosted: true, id: descriptor.id, shared: descriptor }; },
+      showTarget: async state => { await f.download(state.document); doc = { ready: true, hosted: true, id: state.documentId, shared: state.document }; }
+    });
+  };
+  const first = makeAdmin(), second = makeAdmin(), shown = [];
+  const viewer = new MeetingSession({ request: f.request, getDocument: () => ({ ready: false }),
+    subscribe: async (_, handlers) => { f.subscribers.add(handlers.onState); return () => f.subscribers.delete(handlers.onState); },
+    showTarget: async state => shown.push(state.questionId) });
+  await first.join('room', adminKey);
+  await first.shareFile(pdf('shared'));
+  await viewer.join('room');
+  const publishedBeforeJoin = f.published.length;
+  await second.join('room', adminKey);
+  await second.loadSharedDocument();
+  assert.equal(f.published.length, publishedBeforeJoin, 'joining cannot change the participant screen');
+  assert.equal(f.order.filter(x=>x==='upload').length, 1);
+  await first.navigate({ mode: 'question', questionId: 3 });
+  await viewer.applyQueue;
+  f.advance(2000);
+  await second.navigate({ mode: 'question', questionId: 7 });
+  await viewer.applyQueue;
+  f.advance(2000);
+  await first.navigate({ mode: 'question', questionId: 2 });
+  await viewer.applyQueue;
+  assert.deepEqual(shown, [1,3,7,2]);
+  assert.equal(f.order.filter(x=>x==='commit').length, 1, 'taking turns keeps the existing document');
+  await second.join('empty', adminKey);
+  await assert.rejects(second.loadSharedDocument(), /첫 관리자는 PDF/);
+  viewer.leave(); first.leave(); second.leave();
+});
+
+test('upload failure or parse failure leaves the active meeting document unchanged', async () => {
+  const f = await fixture();
+  let current = null;
+  const admin = new MeetingSession({ request: f.request, subscribe: f.subscribe, uploadFile: f.uploadFile, getTarget: () => ({ mode: 'question', questionId: 1 }), getDocument: () => ({ ready: true }), showDocument: async descriptor => { current = descriptor; } });
+  await admin.join('room', adminKey);
+  await admin.shareFile(pdf('working'));
+  const saved = f.states.get('room'), displayed = current;
+  admin.uploadFile = async () => { throw new Error('upload failed'); };
+  await assert.rejects(admin.shareFile(pdf('broken')), /upload failed/);
+  assert.equal(current, displayed);
+  assert.equal(f.states.get('room'), saved);
+  admin.uploadFile = f.uploadFile;
+  admin.showDocument = async () => { throw new Error('parse failed'); };
+  await assert.rejects(admin.shareFile(pdf('broken')), /parse failed/);
+  assert.equal(f.states.get('room'), saved);
+  assert.equal(f.published.length, 1);
+  assert.equal(admin.documentBusy, false);
+});
+
+test('PDF upload validates credentials, size, content, and room; a stored object alone does not change meeting state', async () => {
+  const f = await fixture();
+  const upload = (body, extra = {}, room = 'room') => f.fileHandler(new Request(`https://dashboard.test/.netlify/functions/meeting-document?room=${room}`, {
+    method: 'POST', headers: { Authorization: `Bearer ${adminKey}`, ...extra }, body
+  }));
+  assert.equal((await upload('%PDF-valid', { Authorization: 'Bearer wrong' })).status, 401);
+  assert.equal((await upload('%PDF-valid', { Origin: 'https://other.test' })).status, 403);
+  assert.equal((await upload('not PDF')).status, 400);
+  assert.equal((await upload('')).status, 400);
+  assert.equal((await upload('%PDF-valid', { 'Content-Length': String(f.MAX_PDF_BYTES + 1) })).status, 413);
+  assert.equal((await upload(Buffer.alloc(f.MAX_PDF_BYTES + 1))).status, 413);
+  const { document } = await f.uploadFile('room', pdf('한글 자료'), adminKey);
+  assert.equal(document.name, '한글 자료.pdf');
+  assert.equal(f.states.size, 0);
+  const stored = await f.fileHandler(new Request('https://dashboard.test' + document.url));
+  assert.equal(stored.headers.get('content-type'), 'application/pdf');
+  assert.equal(stored.headers.get('cache-control'), 'private, max-age=86400, immutable');
+  assert.equal((await f.fileHandler(new Request(`https://dashboard.test/.netlify/functions/meeting-document?room=other&file=${document.fileId}`))).status, 404);
+  assert.equal((await f.fileHandler(new Request('https://dashboard.test/.netlify/functions/meeting-document?room=room&file=../../.env'))).status, 404);
+  await assert.rejects(f.request('other', { action: 'set-document', fileId: document.fileId, documentId: document.id, mode: 'question', questionId: 1 }, adminKey), /일치/);
+  await f.request('room', { action: 'set-document', fileId: document.fileId, documentId: document.id, mode: 'question', questionId: 1 }, adminKey);
+  await assert.rejects(f.request('room', { documentId: 'b'.repeat(64), mode: 'question', questionId: 1 }, adminKey), /업로드/);
+});
+
+test('oversize files and concurrent file changes are rejected before replacing the document', async () => {
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  const admin = new MeetingSession({ request: async () => ({ state: { revision: 'ok' } }), subscribe: async () => () => {}, getDocument() {},
+    getTarget: () => ({ mode: 'question', questionId: 1 }), uploadFile: async () => { await pending; return { document: { id: 'a'.repeat(64), fileId: 'test' } }; }, showDocument: async () => {} });
+  await admin.join('room', adminKey);
+  await assert.rejects(admin.shareFile({ name: 'big.pdf', size: 50000001 }), /50MB/);
+  const first = admin.shareFile(pdf('one'));
+  await assert.rejects(admin.shareFile(pdf('two')), /처리하는 중/);
+  release();
+  await first;
+});

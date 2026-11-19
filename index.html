@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>예상질의 대시보드</title>
+  
+  <!-- Mobile Fullscreen / Standalone Web App Meta -->
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#1e293b">
+  <link rel="manifest" href="manifest.json">
+
+  <!-- Pretendard Font & FontAwesome -->
+  <link rel="stylesheet" as="style" crossorigin href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  
+  <!-- PDF.js & pdf-lib -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.9/pdf-lib.min.js"></script>
+
+  <!-- External Stylesheet -->
+  <link rel="stylesheet" href="style.css?v=20261115-attachments">
+</head>
+<body>
+
+  <!-- Main Container (Full Height 100vh) -->
+  <div class="main-container" id="dashboard-shell" data-starting="true" inert aria-hidden="true">
+    
+    <!-- Mobile Sidebar Backdrop -->
+    <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+
+    <!-- Sidebar (Left) -->
+    <aside class="sidebar" id="sidebar">
+      <!-- Mobile Sidebar Header with Close Button -->
+      <div class="sidebar-mobile-header">
+        <span><i class="fa-solid fa-list"></i> 질의 문항 목록</span>
+        <button class="btn-close-sidebar" id="btn-close-sidebar" title="목록 닫기">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
+      </div>
+
+      <!-- Sidebar View Mode Tabs -->
+      <div class="sidebar-tabs">
+        <button class="tab-btn active" id="tab-btn-grid" data-mode="grid" title="3열 번호 버튼 모드">
+          <i class="fa-solid fa-table-cells"></i>
+          <span id="grid-button-label">번호 버튼</span>
+        </button>
+        <button class="tab-btn" id="tab-btn-list" data-mode="list" title="질의 제목 목록 모드">
+          <i class="fa-solid fa-list-ul"></i>
+          <span>제목 목록</span>
+        </button>
+      </div>
+
+      <div class="sidebar-tabs sidebar-order" role="group" aria-label="질의 정렬 방식">
+        <button class="tab-btn active" id="btn-order-category" aria-pressed="true" title="카테고리별로 모아 보기">카테고리순</button>
+        <button class="tab-btn" id="btn-order-number" aria-pressed="false" title="전체 문항을 번호 오름차순으로 보기">번호순</button>
+      </div>
+
+      <div class="receipt-department-filter" id="receipt-department-filter" hidden>
+        <label for="receipt-department">소관부서</label>
+        <select id="receipt-department" aria-describedby="receipt-filter-count">
+          <option value="">전체 부서</option>
+        </select>
+        <small id="receipt-filter-count" role="status">본청 공통 포함</small>
+      </div>
+
+      <!-- Question List -->
+      <div class="q-list" id="q-list">
+        <!-- Questions injected via app.js -->
+      </div>
+    </aside>
+
+    <!-- Resizer Bar (Draggable Bar between Sidebar and Viewer) -->
+    <div class="resizer" id="sidebar-resizer" title="좌우로 드래그하여 목록 너비를 조절하세요"></div>
+
+    <!-- Viewer Container (Right) -->
+    <main class="viewer-container">
+      
+      <!-- Viewer Sticky Toolbar (Integrated with all control buttons) -->
+      <div class="viewer-toolbar">
+        <div class="tool-group left-group">
+          <!-- Sidebar Toggle Button -->
+          <button class="btn-tool btn-mobile-toggle" id="btn-toggle-sidebar" title="질의 목록 숨기기" aria-label="질의 목록 숨기기" aria-controls="sidebar" aria-expanded="true">
+            <i class="fa-solid fa-bars" aria-hidden="true"></i>
+            <span class="btn-text-mobile-menu">목록 숨기기</span>
+          </button>
+
+          <!-- Prev/Next Question Quick Buttons -->
+          <div class="tool-group nav-btn-group">
+            <button class="btn-tool btn-nav-q" id="btn-prev-q" title="이전 문항으로 이동">
+              <i class="fa-solid fa-chevron-left"></i>
+            </button>
+            <button class="btn-tool btn-nav-q" id="btn-next-q" title="다음 문항으로 이동">
+              <i class="fa-solid fa-chevron-right"></i>
+            </button>
+          </div>
+
+          <!-- Current Mode Status Badge (Number Pill, Title & Related Pages) -->
+          <div class="current-mode-badge" id="current-view-mode-badge">
+            <span class="badge-q-num-pill" id="badge-q-num-pill">-</span>
+            <span id="current-mode-title">PDF 문서를 열어주세요</span>
+          </div>
+
+          <!-- TOC View Button -->
+          <button type="button" class="btn-tool btn-meeting" id="meeting-open" data-state="offline" title="회의 연결 및 설정" aria-label="회의 연결 및 설정" aria-haspopup="dialog" aria-controls="meeting-dialog">
+            <i class="fa-solid fa-users" aria-hidden="true"></i>
+            <span class="btn-text-responsive">회의</span>
+          </button>
+          <button type="button" class="btn-tool" id="meeting-message-open" hidden title="참여자에게 메시지 보내기" aria-label="참여자에게 메시지 보내기" aria-haspopup="dialog" aria-controls="meeting-compose-dialog">
+            <i class="fa-solid fa-comment-dots" aria-hidden="true"></i>
+            <span class="btn-text-responsive">메시지</span>
+          </button>
+          <button class="btn-tool btn-tool-toc" id="btn-show-toc" title="전체 목차를 세로 스크롤로 연속 열람합니다" aria-label="전체 목차 보기">
+            <i class="fa-solid fa-list-check"></i>
+            <span class="btn-text-responsive">목차 보기</span>
+          </button>
+        </div>
+
+        <div class="tool-group right-group">
+          <!-- Zoom Controls -->
+          <div class="tool-group zoom-ctrl-group">
+            <button class="btn-tool" id="btn-zoom-out" title="축소"><i class="fa-solid fa-minus"></i></button>
+            <span id="zoom-level" style="font-weight: 700; min-width: 44px; text-align: center; color: #1e293b;">140%</span>
+            <button class="btn-tool" id="btn-zoom-in" title="확대"><i class="fa-solid fa-plus"></i></button>
+          </div>
+
+          <button class="btn-tool" id="btn-zoom-fit" title="현재 화면 가로폭에 100% 맞춤">
+            <i class="fa-solid fa-arrows-left-right-to-line"></i>
+            <span class="btn-text-hide">맞춤</span>
+          </button>
+
+          <div class="toolbar-divider"></div>
+
+          <!-- File Open & Fullscreen Actions -->
+          <button class="btn-tool btn-tool-primary" id="btn-select-file" title="다른 PDF 파일 불러오기">
+            <i class="fa-solid fa-file-arrow-up"></i>
+            <span class="btn-text-responsive">파일 열기</span>
+          </button>
+          
+          <button class="btn-tool" id="btn-ai-settings" title="Gemini AI API 키 설정">
+            <i class="fa-solid fa-gear"></i>
+          </button>
+
+          <button class="btn-tool" id="btn-fullscreen" title="전체화면 모드 (주소창 숨기기)">
+            <i class="fa-solid fa-expand"></i>
+          </button>
+          <input type="file" id="file-input" accept="application/pdf" style="display: none;">
+        </div>
+      </div>
+
+      <!-- PDF Viewport -->
+      <div class="pdf-viewport" id="pdf-viewport">
+        <!-- Rendered Pages will appear here -->
+      </div>
+
+    </main>
+  </div>
+
+  <section class="upload-overlay start-screen" id="upload-overlay" aria-labelledby="start-heading">
+    <div class="start-panel">
+      <span class="start-brand"><i class="fa-solid fa-layer-group" aria-hidden="true"></i> 예상질의 대시보드</span>
+      <h1 id="start-heading">회의를 시작하세요</h1>
+      <p class="start-description">관리자로 자료를 공유하거나, 진행 중인 회의에 참여하세요.</p>
+      <div class="start-options">
+        <button type="button" class="start-option start-option-admin" id="start-admin" aria-haspopup="dialog" aria-controls="meeting-dialog">
+          <span class="start-option-icon"><i class="fa-solid fa-user-shield" aria-hidden="true"></i></span>
+          <strong>회의 개설하기</strong>
+          <span>회의 이름과 PDF로<br>새 회의를 개설합니다.</span>
+          <span class="start-option-link">회의 개설 <i class="fa-solid fa-arrow-right" aria-hidden="true"></i></span>
+        </button>
+        <button type="button" class="start-option" id="start-viewer" aria-haspopup="dialog" aria-controls="meeting-dialog">
+          <span class="start-option-icon"><i class="fa-solid fa-users" aria-hidden="true"></i></span>
+          <strong>회의 참여하기</strong>
+          <span>열려 있는 회의를 선택하면<br>자료가 자동으로 열립니다.</span>
+          <span class="start-option-link">회의 입장 <i class="fa-solid fa-arrow-right" aria-hidden="true"></i></span>
+        </button>
+      </div>
+      <p id="start-status" class="start-status" role="status" aria-live="polite">참여자는 별도의 PDF 파일이나 관리자 키가 필요하지 않습니다.</p>
+      <button type="button" id="start-owner" class="start-owner" hidden>최상위 관리자 · 서버 관리</button>
+    </div>
+  </section>
+
+  <!-- Toast Notification (Disabled) -->
+  <div class="toast" id="toast">
+    <i class="fa-solid fa-circle-check"></i>
+    <span id="toast-message">알림 메시지</span>
+  </div>
+
+  <!-- Global Window Drag & Drop Overlay -->
+  <div class="window-drag-overlay" id="window-drag-overlay">
+    <i class="fa-solid fa-file-arrow-up"></i>
+    <h2>PDF 문서를 여기에 놓으세요</h2>
+    <p>문서를 놓으면 새 결산 질의서가 즉시 로드됩니다.</p>
+  </div>
+
+  <!-- AI Analysis Loading Overlay -->
+  <div class="ai-loading-overlay" id="ai-loading-overlay" style="display: none;">
+    <div class="ai-loading-card">
+      <div class="ai-spinner">
+        <i class="fa-solid fa-robot"></i>
+      </div>
+      <h3 id="ai-loading-title">Gemini AI가 목차를 분석하는 중...</h3>
+      <p id="ai-loading-desc">다양한 부서 서식의 목차에서 질의 문항과 관련 쪽수를 자동으로 추출하고 있습니다.</p>
+      <div class="ai-loading-progress">
+        <div class="ai-progress-bar"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- AI Settings Modal -->
+  <div class="modal-backdrop" id="ai-settings-modal" style="display: none;">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3><i class="fa-solid fa-robot"></i> Gemini AI 설정</h3>
+        <button class="btn-close-modal" id="btn-close-ai-modal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-desc">
+          새로운 부서의 결산 질의서 PDF를 정규식 없이 AI로 자동 분석하기 위해 <strong>Gemini API Key</strong>가 필요합니다.
+          키는 <code>.env</code> 파일에 넣거나 아래에 직접 입력할 수 있습니다.
+        </p>
+        <div class="form-group">
+          <label for="input-api-key">Gemini API Key</label>
+          <input type="password" id="input-api-key" placeholder="AIzaSy... 형식의 API 키 입력">
+          <span class="key-status-hint" id="key-status-hint">현재 상태: 확인 중...</span>
+        </div>
+        <div class="guide-box">
+          <p><i class="fa-solid fa-circle-info"></i> <strong>무료 API 키 발급 방법:</strong></p>
+          <ol>
+            <li><a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">Google AI Studio (aistudio.google.com)</a>에 로그인</li>
+            <li><strong>[Create API key]</strong> 버튼 클릭 후 키 복사</li>
+            <li>작업 폴더의 <code>.env</code> 파일의 <code>GEMINI_API_KEY=</code> 뒤에 붙여넣거나 위에 입력</li>
+          </ol>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-modal-secondary" id="btn-test-ai-key" style="margin-right: auto; color: #1e40af; border-color: #bfdbfe; background: #eff6ff;">
+          <i class="fa-solid fa-vial-circle-check"></i> 연결 테스트
+        </button>
+        <button class="btn-modal-secondary" id="btn-cancel-ai-key">닫기</button>
+        <button class="btn-modal-primary" id="btn-save-ai-key">저장하기</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- External Script -->
+  <dialog id="meeting-dialog" class="meeting-dialog" aria-labelledby="meeting-heading">
+    <div class="meeting-dialog-heading">
+      <h2 id="meeting-heading">실시간 회의 연결</h2>
+      <button type="button" id="meeting-close" aria-label="회의 설정 닫기">닫기</button>
+    </div>
+    <p id="meeting-intro">각자 문항을 열람하다가도 관리자가 이동하면 해당 문항이 우선 표시됩니다. 확대와 스크롤은 각자 조절합니다.</p>
+    <div id="meeting-role-switch" class="meeting-role-switch" role="group" aria-label="회의 역할 선택">
+      <button type="button" id="meeting-role-admin" aria-pressed="false">관리자로 참여</button>
+      <button type="button" id="meeting-role-viewer" aria-pressed="true">참여자로 참여</button>
+    </div>
+    <dl id="meeting-info" class="meeting-info" hidden>
+      <dt>회의 이름</dt><dd id="meeting-info-room"></dd>
+      <dt>자료</dt><dd id="meeting-info-document"></dd>
+      <dt>내 역할</dt><dd id="meeting-info-role"></dd>
+    </dl>
+    <p id="meeting-status" class="meeting-status" role="status" aria-live="polite">개별 열람</p>
+    <div class="meeting-actions">
+      <button type="button" id="meeting-owner" hidden>서버 관리 화면으로</button>
+    </div>
+    <section id="meeting-directory" hidden aria-label="회의 목록">
+      <div class="meeting-directory-tools">
+        <button type="button" id="meeting-list-refresh">목록 새로고침</button>
+      </div>
+      <form id="meeting-directory-login" hidden>
+        <label for="meeting-directory-key">관리자 인증키</label>
+        <input id="meeting-directory-key" type="password" autocomplete="off" placeholder="관리자 인증키">
+        <button type="submit">인증</button>
+        <button type="button" id="meeting-directory-logout" hidden>로그아웃</button>
+      </form>
+      <p id="meeting-directory-status" role="status" aria-live="polite"></p>
+      <div id="meeting-list"></div>
+    </section>
+    <form id="meeting-form">
+      <label for="meeting-room">회의 이름</label>
+      <input id="meeting-room" name="room" maxlength="64" pattern="[a-zA-Z0-9가-힣ㄱ-ㅎㅏ-ㅣ _\-]{1,64}" required autocomplete="off" placeholder="예: 2026 행정사무감사">
+      <button type="submit" id="meeting-viewer">회의 참여하기</button>
+      <fieldset id="meeting-admin-fields" hidden disabled>
+      <label for="meeting-key">관리자 인증키</label>
+      <input id="meeting-key" type="password" autocomplete="off" placeholder="서버에 설정한 관리자 인증키 (6자 이상)">
+      <fieldset class="document-type-options">
+        <legend>자료구분</legend>
+        <label><input id="meeting-type-questions" type="radio" name="documentType" value="questions" checked> 예상질의·답변서</label>
+        <label><input id="meeting-type-receipt" type="radio" name="documentType" value="receipt"> 행정사무감사 수감자료</label>
+      </fieldset>
+      <label for="meeting-pdf">회의 PDF <small>관리자만 선택 · 최대 50MB</small></label>
+      <input id="meeting-pdf" type="file" accept="application/pdf,.pdf">
+      <p class="meeting-pdf-hint" id="meeting-pdf-hint">첫 관리자는 PDF를 선택하세요. 추가 관리자는 같은 회의 이름과 인증키를 입력하면 기존 자료로 접속합니다.</p>
+      <button type="submit" id="meeting-admin">관리자로 연결 · 선택한 PDF 업로드</button>
+      </fieldset>
+    </form>
+    <div id="meeting-sharing" hidden>
+    <label for="meeting-link">이용자 접속 주소</label>
+    <div class="meeting-share">
+      <input id="meeting-link" type="text" readonly placeholder="회의 연결 후 표시됩니다">
+      <button type="button" id="meeting-copy">복사</button>
+    </div>
+    </div>
+    <p id="meeting-error" role="status" aria-live="polite"></p>
+    <button type="button" id="meeting-leave" hidden>회의 나가기</button>
+  </dialog>
+  <dialog id="meeting-compose-dialog" class="meeting-dialog" aria-labelledby="meeting-compose-heading">
+    <div class="meeting-dialog-heading">
+      <h2 id="meeting-compose-heading">참여자에게 메시지 보내기</h2>
+      <button type="button" id="meeting-compose-close" aria-label="메시지 작성 닫기">닫기</button>
+    </div>
+    <form id="meeting-message-form" hidden>
+      <label for="meeting-message-text">메시지 내용 (선택)</label>
+      <textarea id="meeting-message-text" rows="4" maxlength="1000" placeholder="전체 참여자에게 전달할 내용을 입력하세요. 첨부만 보낼 수도 있습니다."></textarea>
+      <div id="meeting-attachment-drop" class="meeting-attachment-drop">
+        <p>이미지·PDF를 여기에 놓거나 선택하세요</p>
+        <div class="meeting-attachment-actions">
+          <button type="button" id="meeting-attachment-choose">파일·사진 선택</button>
+          <button type="button" id="meeting-attachment-camera" class="meeting-camera-button">사진 촬영</button>
+          <button type="button" id="meeting-attachment-remove" hidden>첨부 제거</button>
+        </div>
+        <input type="file" id="meeting-attachment-file" accept="image/jpeg,image/png,image/webp,image/gif,image/heic,image/heif,application/pdf,.pdf" hidden>
+        <input type="file" id="meeting-attachment-capture" accept="image/*" capture="environment" hidden>
+        <img id="meeting-attachment-preview" class="meeting-attachment-preview" alt="보낼 이미지 미리보기" hidden>
+        <p id="meeting-attachment-info" role="status" aria-live="polite">한 번에 1개 · PDF 최대 50MB · 사진은 전송 전에 용량을 줄입니다.</p>
+      </div>
+      <p class="meeting-message-hint">최대 1,000자 · 참여자가 닫을 때까지 팝업으로 표시됩니다.</p>
+      <button type="submit" id="meeting-message-send">전체 참여자에게 전송</button>
+      <p id="meeting-message-feedback" role="status" aria-live="polite"></p>
+    </form>
+  </dialog>
+  <dialog id="meeting-message-dialog" class="meeting-message-dialog" aria-labelledby="meeting-message-heading" aria-describedby="meeting-message-body" closedby="none">
+    <header class="meeting-message-heading">
+      <h2 id="meeting-message-heading">회의 메시지</h2>
+      <span>관리자 알림</span>
+    </header>
+    <div id="meeting-message-body" class="meeting-message-body" tabindex="0"></div>
+    <div id="meeting-message-media" class="meeting-message-media" hidden></div>
+    <footer class="meeting-message-footer">
+      <span>내용을 확인한 뒤 닫아주세요.</span>
+      <button type="button" id="meeting-message-close" autofocus>닫기</button>
+    </footer>
+  </dialog>
+  <script src="dashboard-config.js?v=20261103-empty-start" defer></script>
+  <script src="sha256.js" defer></script>
+  <script src="app.js?v=20261110-category-default" defer></script>
+  <script src="message-media.js?v=20261115-attachments" defer></script>
+  <script src="live-session.js?v=20261115-attachments" defer></script>
+</body>
+</html>

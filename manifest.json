@@ -1,0 +1,10 @@
+{
+  "name": "예상질의 대시보드",
+  "short_name": "예상질의 대시보드",
+  "description": "예상질의 답변서 PDF를 열람하는 대시보드",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0f172a",
+  "theme_color": "#1e293b"
+}

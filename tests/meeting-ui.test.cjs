@@ -1,0 +1,334 @@
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const { webcrypto } = require('node:crypto');
+
+test('meeting form authenticates, clears the key field, and shares a viewer URL without credentials', async () => {
+  const listeners = {}, elements = new Map(), writes = [];
+  const html = fs.readFileSync('index.html', 'utf8');
+  for (const [, id] of html.matchAll(/id="([^"]+)"/g)) elements.set(id, {
+    value: '', dataset: {}, hidden: false, textContent: '',
+    addEventListener(name, listener) { this[name] = listener; },
+    querySelectorAll() { return []; },
+    click() { this.clicked = true; },
+    showModal() { this.open = true; },
+    close() { this.open = false; if (this.closeListener) this.closeListener(); }
+  });
+  const dialog = elements.get('meeting-dialog');
+  dialog.addEventListener = (name, listener) => { if (name === 'close') dialog.closeListener = listener; };
+  const doc = { getElementById: id => elements.get(id), addEventListener: (name, fn) => { listeners[name] = fn; } };
+  const location = { href: 'https://dashboard.example/index.html?old=1#section' };
+  const pdf = new File(['%PDF-1.7\nfixture'], 'meeting.pdf', { type: 'application/pdf' });
+  const descriptor = { id: 'a'.repeat(64), fileId: '12345678-1234-1234-1234-123456789abc', name: 'meeting.pdf', url: '/.netlify/functions/meeting-document?room=audit-2026&file=12345678-1234-1234-1234-123456789abc' };
+  let copied;
+  let sharedState = null;
+  let receiveBroadcast;
+  const storedMessages = [];
+  const loaded = [];
+  const context = {
+    document: doc, location, URL, AbortSignal,
+    history: { replaceState: (_, __, url) => { location.href = String(url); } },
+    navigator: { clipboard: { writeText: async text => { copied = text; } } },
+    setTimeout, clearTimeout,
+    Ably: { Realtime: class {
+      constructor() {
+        this.connection = { on() {}, off() {} };
+        this.channels = { get: () => ({ on() {}, off() {}, subscribe: async (_, callback) => { receiveBroadcast = callback; }, unsubscribe() {} }) };
+      }
+      connect() {}
+      close() {}
+    } },
+    addEventListener: (name, fn) => { listeners[name] = fn; },
+    DASHBOARD_CONFIG: { meetingEndpoint: '/.netlify/functions/meeting' },
+    DashboardMeeting: { getDocument: () => ({ ready: true, hosted: true, id: 'a'.repeat(64) }), getTarget: () => ({ mode: 'question', questionId: 3 }), getFile: () => pdf, showDocument: async () => {}, showTarget: async state => loaded.push(state) },
+    fetch: async (url, options) => {
+      if (options.headers['Content-Type'] === 'application/pdf') {
+        writes.push({ url: String(url), body: options.body, headers: options.headers });
+        return { ok: true, json: async () => ({ document: descriptor }) };
+      }
+      const body = options.body ? JSON.parse(options.body) : null;
+      if (new URL(url).searchParams.get('action') === 'token') return { ok: true, json: async () => ({ channel: 'test', tokenRequest: {} }) };
+      writes.push({ url: String(url), body, headers: options.headers });
+      if (body?.action === 'authenticate') return { ok: true, json: async () => ({ authenticated: true }) };
+      if (body?.action === 'send-message') {
+        const message = { id: `message-${storedMessages.length}`, text: body.text, sentAt: Date.now() };
+        storedMessages.push(message);
+        return { ok: true, json: async () => ({ message }) };
+      }
+      if (body) sharedState = { sequence: 1, revision: 'one', document: descriptor, documentId: descriptor.id, mode: 'question', questionId: 3, controllerId: body.controllerId };
+      return { ok: true, json: async () => ({ state: sharedState, messages: storedMessages }) };
+    }
+  };
+  context.window = context;
+  vm.runInNewContext(fs.readFileSync('live-session.js', 'utf8'), context);
+  listeners.DOMContentLoaded();
+  elements.get('start-viewer').onclick();
+  assert.equal(elements.get('meeting-admin-fields').hidden, true);
+  assert.equal(elements.get('meeting-admin-fields').disabled, true);
+  assert.equal(elements.get('meeting-viewer').hidden, false);
+  assert.equal(elements.get('meeting-room').value, '');
+  elements.get('start-admin').onclick();
+  assert.equal(elements.has('start-document-type'), false);
+  elements.get('meeting-type-receipt').checked = true;
+  elements.get('meeting-type-questions').checked = false;
+  elements.get('start-admin').onclick();
+  assert.equal(elements.get('meeting-type-receipt').checked, true);
+  assert.equal(elements.get('meeting-admin-fields').hidden, false);
+  assert.equal(elements.get('meeting-admin-fields').disabled, false);
+  assert.equal(elements.get('meeting-viewer').hidden, true);
+  elements.get('meeting-room').value = 'audit-2026';
+  elements.get('meeting-key').value = 'test-only-key-never-share-this';
+  elements.get('meeting-pdf').files = [pdf];
+  await elements.get('meeting-form').onsubmit({ preventDefault() {}, submitter: { id: 'meeting-admin' } });
+  assert.equal(elements.get('meeting-key').value, '');
+  elements.get('meeting-open').onclick();
+  assert.equal(elements.get('meeting-heading').textContent, '회의 정보');
+  assert.equal(elements.get('meeting-info-room').textContent, 'audit-2026');
+  assert.equal(elements.get('meeting-info-role').textContent, '관리자');
+  assert.equal(elements.get('meeting-form').hidden, true);
+  assert.equal(elements.get('meeting-role-switch').hidden, true);
+  assert.equal(elements.get('meeting-sharing').hidden, false);
+  assert.equal(elements.has('meeting-send'), false);
+  assert.equal(elements.has('meeting-message-settings'), false);
+  elements.get('meeting-close').onclick();
+  assert.equal(elements.get('meeting-open').dataset.state, 'admin');
+  assert.match(elements.get('meeting-open').title, /관리자 제어 중/);
+  assert.equal(writes[0].body.action, 'authenticate');
+  assert.equal(writes[2].body, pdf);
+  assert.equal(writes[2].headers['X-Document-Type'], 'receipt');
+  assert.equal(writes[3].body.action, 'set-document');
+  assert.equal(writes[3].body.questionId, 3);
+  listeners['dashboard-document-ready']();
+  assert.equal(elements.get('dashboard-shell').dataset.starting, 'false');
+  assert.equal(elements.get('dashboard-shell').inert, false);
+  await elements.get('meeting-copy').onclick();
+  assert.equal(copied, 'https://dashboard.example/index.html?room=audit-2026');
+  assert.ok(!copied.includes('key'));
+  elements.get('meeting-leave').onclick();
+  assert.equal(elements.get('meeting-info').hidden, true);
+  assert.equal(elements.get('meeting-open').dataset.state, 'offline');
+  assert.ok(!location.href.includes('room='));
+  elements.get('start-admin').onclick();
+  elements.get('meeting-room').value = 'audit-2026';
+  elements.get('meeting-key').value = 'test-only-key-never-share-this';
+  elements.get('meeting-pdf').files = [];
+  const before = writes.length;
+  await elements.get('meeting-form').onsubmit({ preventDefault() {} });
+  assert.equal(writes.length, before + 2, 'additional admin only authenticates and reads the shared state');
+  assert.equal(writes[before].body.action, 'authenticate');
+  assert.equal(writes[before + 1].body, null);
+  assert.equal(loaded.length, 1);
+  assert.equal(loaded[0].document.fileId, descriptor.fileId);
+  assert.equal(elements.get('meeting-open').dataset.state, 'cooldown');
+  assert.equal(elements.get('meeting-message-open').hidden, false);
+  elements.get('meeting-message-text').value = '<img src=x onerror=alert(1)>\n회의 메시지';
+  await elements.get('meeting-message-form').onsubmit({ preventDefault() {} });
+  assert.equal(writes.at(-1).body.action, 'send-message');
+  assert.equal(elements.get('meeting-message-text').value, '');
+  assert.equal(elements.get('meeting-message-feedback').dataset.state, 'sent');
+  elements.get('meeting-leave').onclick();
+  elements.get('start-viewer').onclick();
+  elements.get('meeting-room').value = 'audit-2026';
+  await elements.get('meeting-form').onsubmit({ preventDefault() {} });
+  const popup = elements.get('meeting-message-dialog');
+  assert.equal(elements.get('meeting-message-form').hidden, true);
+  assert.equal(elements.get('meeting-message-open').hidden, true);
+  assert.ok(!popup.open, 'messages from before entry do not reopen');
+  receiveBroadcast({ data: { type: 'message', message: { id: 'fresh', text: '입장 후 메시지', sentAt: Date.now() } } });
+  assert.equal(popup.open, true);
+  assert.equal(elements.get('meeting-message-body').textContent, '입장 후 메시지');
+  let cancelled = false;
+  popup.cancel({ preventDefault() { cancelled = true; } });
+  assert.equal(cancelled, true);
+  assert.equal(popup.open, true);
+  receiveBroadcast({ data: { type: 'message', message: { id: 'next', text: '다음 메시지', sentAt: Date.now() } } });
+  assert.equal(elements.get('meeting-message-body').textContent, '입장 후 메시지');
+  receiveBroadcast({ data: { ...sharedState, sequence: 2, revision: 'next-navigation' } });
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(popup.open, true, 'navigation does not dismiss the popup');
+  elements.get('meeting-message-close').onclick();
+  assert.equal(elements.get('meeting-message-body').textContent, '다음 메시지');
+  assert.equal(popup.open, true);
+  elements.get('meeting-message-close').onclick();
+  assert.equal(popup.open, false);
+  elements.get('meeting-leave').onclick();
+  elements.get('start-admin').onclick();
+  elements.get('meeting-room').value = 'audit-2026';
+  elements.get('meeting-key').value = 'test-only-key-never-share-this';
+  await elements.get('meeting-form').onsubmit({ preventDefault() {} });
+  context.MessageMedia = { prepareMessageFile: async file => ({ file, originalSize: file.size }) };
+  elements.get('meeting-attachment-choose').onclick();
+  assert.equal(elements.get('meeting-attachment-file').clicked, true);
+  elements.get('meeting-attachment-camera').onclick();
+  assert.equal(elements.get('meeting-attachment-capture').clicked, true);
+  const drop = elements.get('meeting-attachment-drop');
+  await drop.ondrop({ preventDefault() {}, dataTransfer: { files: [pdf] } });
+  assert.match(elements.get('meeting-attachment-info').textContent, /meeting.pdf/);
+  assert.equal(elements.get('meeting-attachment-remove').hidden, false);
+  elements.get('meeting-message-text').value = '';
+  await elements.get('meeting-message-form').onsubmit({ preventDefault() {} });
+  assert.equal(writes.at(-2).headers['X-Document-Purpose'], 'message');
+  assert.equal(writes.at(-1).body.action, 'send-message');
+  assert.equal(writes.at(-1).body.attachmentId, descriptor.fileId);
+  assert.equal(writes.at(-1).body.text, '');
+  assert.equal(elements.get('meeting-attachment-remove').hidden, true);
+  elements.get('meeting-attachment-file').files = [pdf];
+  await elements.get('meeting-attachment-file').onchange();
+  assert.equal(elements.get('meeting-attachment-remove').hidden, false);
+  elements.get('meeting-attachment-remove').onclick();
+  assert.equal(elements.get('meeting-attachment-remove').hidden, true);
+  elements.get('meeting-leave').onclick();
+  context.fetch = async () => ({ ok: false, status: 429, json: async () => { throw new Error('plain text edge response'); } });
+  elements.get('start-viewer').onclick();
+  elements.get('meeting-room').value = 'audit-2026';
+  await elements.get('meeting-form').onsubmit({ preventDefault() {} });
+  assert.match(elements.get('meeting-error').textContent, /요청이 너무 잦습니다/);
+});
+
+function appContext() {
+  const events = [], listeners = {};
+  const context = {
+    console, crypto: webcrypto,
+    window: { addEventListener: (name, listener) => { listeners[name] = listener; }, dispatchEvent: event => events.push(event) },
+    document: { addEventListener() {} },
+    CustomEvent: class { constructor(type, options = {}) { this.type = type; this.detail = options.detail; } }
+  };
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync('app.js', 'utf8'), context);
+  vm.runInContext(`
+    currentItems = [{ id: 1 }, { id: 2 }];
+    meetingDocument = { ready: true, hosted: true, id: '${'a'.repeat(64)}' };
+    renderCurrentView = async () => { selectedQuestionId = currentQuestion.id; currentViewMode = 'question'; };
+    closeMobileSidebar = () => {};
+  `, context);
+  return { context, events, listeners };
+}
+
+test('dropping an attachment in the compose dialog cannot trigger the global meeting PDF replacement', () => {
+  const { context, listeners } = appContext();
+  const compose = { open: true };
+  context.document.getElementById = id => id === 'meeting-compose-dialog' ? compose : null;
+  let replacements = 0;
+  context.processPdfFile = () => { replacements++; };
+  const event = { preventDefault() {}, dataTransfer: { files: [{ name: 'attachment.pdf' }] } };
+  listeners.dragenter(event);
+  listeners.drop(event);
+  assert.equal(replacements, 0);
+  compose.open = false;
+  listeners.drop(event);
+  assert.equal(replacements, 1, 'normal dashboard drops still work outside the compose dialog');
+});
+
+test('actual dashboard navigation broadcasts local moves and never echoes remote moves', async () => {
+  const { context, events } = appContext();
+  await context.openQuestion(1);
+  assert.equal(events.length, 1);
+  await context.window.DashboardMeeting.showTarget({ documentId: 'a'.repeat(64), mode: 'question', questionId: 2 });
+  assert.equal(events.length, 1);
+  assert.equal(context.window.DashboardMeeting.getTarget().questionId, 2);
+  await context.openQuestion(1);
+  assert.equal(events.length, 2);
+  assert.equal(context.window.DashboardMeeting.getTarget().questionId, 1);
+});
+
+test('administrator cooldown blocks question and TOC clicks before changing the local screen; remote navigation still applies', async () => {
+  const { context, events } = appContext();
+  await context.openQuestion(1);
+  context.window.MeetingFiles = { canNavigate: () => false };
+  await context.openQuestion(2);
+  await context.openTocView();
+  assert.equal(events.length, 1);
+  assert.equal(context.window.DashboardMeeting.getTarget().questionId, 1);
+  await context.window.DashboardMeeting.showTarget({ documentId: 'a'.repeat(64), mode: 'question', questionId: 2 });
+  assert.equal(context.window.DashboardMeeting.getTarget().questionId, 2);
+  assert.equal(events.length, 1);
+});
+
+test('dashboard refuses mismatched PDFs and missing questions; a local PDF switches only to an uploaded meeting document', async () => {
+  const { context } = appContext();
+  await assert.rejects(context.window.DashboardMeeting.showTarget({ documentId: 'b'.repeat(64), mode: 'question', questionId: 1 }), /PDF.*다릅니다/);
+  await assert.rejects(context.window.DashboardMeeting.showTarget({ documentId: 'a'.repeat(64), mode: 'question', questionId: 99 }), /문항/);
+  vm.runInContext(`
+    meetingDocument.hosted = false;
+  `, context);
+  await assert.rejects(context.window.DashboardMeeting.showTarget({ documentId: 'a'.repeat(64), mode: 'question', questionId: 2 }), /자료 정보/);
+  vm.runInContext('loadSharedPdf = async descriptor => { meetingDocument.hosted = true; meetingDocument.shared = descriptor; }', context);
+  await context.window.DashboardMeeting.showTarget({ document: { id: 'a'.repeat(64), fileId: 'uploaded-file' }, documentId: 'a'.repeat(64), mode: 'question', questionId: 2 });
+  assert.equal(context.window.DashboardMeeting.getDocument().hosted, true);
+  assert.equal(context.window.DashboardMeeting.getTarget().questionId, 2);
+});
+
+test('shared PDF loader checks downloaded bytes before replacing a document and restores the old document after parse failure', async () => {
+  const { context } = appContext();
+  const { createHash } = require('node:crypto');
+  const first = Buffer.from('%PDF-1.7\nfirst');
+  const second = Buffer.from('%PDF-1.7\nsecond');
+  const id = bytes => createHash('sha256').update(bytes).digest('hex');
+  context.window.crypto = webcrypto;
+  context.window.location = { href: 'https://dashboard.example/index.html' };
+  context.URL = URL;
+  context.AbortSignal = AbortSignal;
+  context.document.getElementById = () => null;
+  context.alert = () => {};
+  context.console = { error() {} };
+  context.pdfjsLib = { getDocument: () => ({ promise: Promise.resolve({}) }) };
+  vm.runInContext(`
+    renderQuestionList = () => {};
+    parseUploadedPdf = async (_, name) => {
+      if (name === 'broken.pdf') throw new Error('parse failure');
+      currentItems = [{ id: 1 }, { id: 2 }];
+    };
+  `, context);
+  context.initialBytes = first.buffer.slice(first.byteOffset, first.byteOffset + first.byteLength);
+  await vm.runInContext('loadPdfBuffer(initialBytes, "first.pdf", true)', context);
+  assert.equal(context.window.DashboardMeeting.getDocument().id, id(first));
+  context.fetch = async () => ({ ok: true, arrayBuffer: async () => second.buffer.slice(second.byteOffset, second.byteOffset + second.byteLength) });
+  const descriptor = { id: id(second), fileId: '12345678-1234-1234-1234-123456789abc', name: 'second.pdf', url: '/.netlify/functions/meeting-document?room=test&file=12345678-1234-1234-1234-123456789abc' };
+  await assert.rejects(context.window.DashboardMeeting.showDocument({ ...descriptor, id: 'b'.repeat(64) }), /검증/);
+  assert.equal(context.window.DashboardMeeting.getDocument().id, id(first));
+  await assert.rejects(context.window.DashboardMeeting.showDocument({ ...descriptor, name: 'broken.pdf' }), /분석/);
+  assert.equal(context.window.DashboardMeeting.getDocument().id, id(first));
+  await context.window.DashboardMeeting.showDocument(descriptor);
+  assert.equal(context.window.DashboardMeeting.getDocument().shared.fileId, descriptor.fileId);
+  let downloads = 0;
+  context.fetch = async () => { downloads++; throw new Error('same PDF must not be downloaded again'); };
+  await context.window.DashboardMeeting.showTarget({ document: descriptor, documentId: descriptor.id, mode: 'question', questionId: 2 });
+  assert.equal(downloads, 0);
+  assert.equal(context.window.DashboardMeeting.getTarget().questionId, 2);
+});
+
+test('dashboard assembles chunk downloads, applies the shared document type and rejects corrupted or missing parts', async () => {
+  const { context } = appContext();
+  const { createHash } = require('node:crypto');
+  const bytes = Buffer.alloc(6_100_000, 42);
+  bytes.write('%PDF-1.7\n');
+  context.window.crypto = webcrypto;
+  context.window.location = { href: 'https://dashboard.example/index.html' };
+  context.URL = URL;
+  context.AbortSignal = AbortSignal;
+  context.document.getElementById = () => null;
+  context.alert = () => {};
+  context.pdfjsLib = { getDocument: () => ({ promise: Promise.resolve({}) }) };
+  vm.runInContext('renderQuestionList = () => {}; parseUploadedPdf = async () => { currentItems = [{ id: 1 }]; };', context);
+  const descriptor = { id: createHash('sha256').update(bytes).digest('hex'), fileId: '12345678-1234-1234-1234-123456789abc',
+    name: 'receipt.pdf', documentType: 'receipt', parts: 3, size: bytes.length,
+    url: '/.netlify/functions/meeting-document?room=test&file=12345678-1234-1234-1234-123456789abc' };
+  const parts = [];
+  context.fetch = async (url, options) => {
+    assert.equal(options.cache, 'default', 'PDF parts can reuse the private browser HTTP cache');
+    const part = Number(url.searchParams.get('part'));
+    parts.push(part);
+    const chunk = bytes.subarray(part * 3000000, (part + 1) * 3000000);
+    return { ok: true, arrayBuffer: async () => chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.length) };
+  };
+  await context.window.DashboardMeeting.showDocument(descriptor);
+  assert.deepEqual(parts, [0, 1, 2]);
+  assert.equal(context.window.DashboardMeeting.getDocument().documentType, 'receipt');
+  context.fetch = async () => ({ ok: false });
+  await assert.rejects(context.window.DashboardMeeting.showDocument(descriptor), /다운로드/);
+  assert.equal(context.window.DashboardMeeting.getDocument().id, descriptor.id);
+  context.fetch = async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(1) });
+  await assert.rejects(context.window.DashboardMeeting.showDocument(descriptor), /조각 크기/);
+  await assert.rejects(context.window.DashboardMeeting.showDocument({ ...descriptor, parts: 18 }), /크기 정보/);
+});

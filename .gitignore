@@ -1,0 +1,33 @@
+# API Key & Secrets (절대 깃허브에 올리지 마세요)
+.env
+.env.local
+.env.*.local
+
+# Temporary / Scratch files
+scratch/
+local-archive/
+*.tmp
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Generated Netlify deployment package
+netlify-deploy/
+netlify-deploy.zip
+node_modules/
+.netlify/
+server-data/
+server-vendor/
+server-package/
+dashboard-server-windows.zip
+
+
+runtime/
+
+# Generated launcher and installation archives
+DashboardServer.exe
+dashboard-server-windows*.zip
+.env.example
