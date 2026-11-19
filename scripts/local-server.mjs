@@ -195,7 +195,14 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const lan = process.argv.includes('--lan');
   const dataArg = process.argv.indexOf('--data-dir');
   const dataDirectory = lan ? path.resolve(dataArg === -1 ? path.join(root, 'server-data') : process.argv[dataArg + 1]) : undefined;
-  const { server, missing } = createLocalServer({ lan, dataDirectory, ...(lan ? { saveAdminKey: key => writeAdminKey(path.join(root, '.env'), key) } : {}) });
+  const { server, missing, closeConnections } = createLocalServer({ lan, dataDirectory, ...(lan ? {
+    saveAdminKey: key => writeAdminKey(path.join(root, '.env'), key),
+    onShutdown: () => {
+      server.close();
+      closeConnections();
+      server.closeAllConnections();
+    }
+  } : {}) });
   if (lan && missing.length) { console.error('Set MEETING_ADMIN_KEY (at least 6 characters) in .env before starting the server.'); process.exit(1); }
   const openAppWindow = () => {
     const appBrowserArg = process.argv.indexOf('--app-browser');
